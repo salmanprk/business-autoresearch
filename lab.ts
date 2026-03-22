@@ -25,6 +25,7 @@ import {
   writeFileSync,
   appendFileSync,
   copyFileSync,
+  rmSync,
 } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -42,9 +43,55 @@ const PROGRAM_PATH = resolve(ROOT, "program.md");
 const EXPERIMENTS_CSV = resolve(ROOT, "experiments.csv");
 const EXPERIMENTS_DIR = resolve(ROOT, "experiments");
 
-const MODEL = process.env.MODEL ?? "moonshotai/kimi-k2.5";
+const MODEL = process.env.MODEL ?? "anthropic/claude-sonnet-4.6"; //"moonshotai/kimi-k2.5";
 const MAX_RUNS = process.env.MAX_RUNS ? parseInt(process.env.MAX_RUNS) : 10;
 const DRY_RUN = process.argv.includes("--dry-run");
+const API_BASE = process.env.API_BASE ?? "http://localhost:5173/api/crs";
+
+// ---------------------------------------------------------------------------
+// System context — fetched once at startup, injected into every prompt
+// ---------------------------------------------------------------------------
+
+async function fetchSystemContext(): Promise<string> {
+  // Read strategy.ts to get userId and cutoff
+  const strategyContent = readFileSync(STRATEGY_PATH, "utf-8");
+  const userIdMatch = strategyContent.match(/userId:\s*"([^"]+)"/);
+  const cutoffMatch = strategyContent.match(/cutoff:\s*(\d+)/);
+
+  if (!userIdMatch || !cutoffMatch) {
+    console.warn(
+      "Warning: Could not extract userId/cutoff from strategy.ts — skipping context fetch",
+    );
+    return "";
+  }
+
+  const userId = userIdMatch[1];
+  const cutoff = parseInt(cutoffMatch[1]);
+
+  try {
+    console.log("Fetching system context from /api/crs/opportunities...");
+    const res = await fetch(`${API_BASE}/opportunities`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId, cutoff }),
+    });
+    const data = await res.json();
+
+    if (data.error) {
+      console.warn(
+        `Warning: Opportunities endpoint returned error: ${data.error}`,
+      );
+      return "";
+    }
+
+    return `\n## System Context (from /api/crs/opportunities)\n\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\`\n`;
+  } catch (err) {
+    console.warn(
+      `Warning: Could not fetch opportunities: ${err instanceof Error ? err.message : err}`,
+    );
+    return "";
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Strategy backup/restore (replaces git)
@@ -162,6 +209,7 @@ async function proposeVariant(
   baselineScore: number,
   baselineMetrics: Record<string, number>,
   expNum: number,
+  systemContext: string,
 ): Promise<{ newStrategy: string; description: string }> {
   // Dry-run mode — return mock variants without calling an LLM
   if (DRY_RUN) {
@@ -172,7 +220,7 @@ async function proposeVariant(
 
 ## Program (your instructions)
 ${program}
-
+${systemContext}
 ## Current Strategy (strategy.ts)
 \`\`\`typescript
 ${currentStrategy}
@@ -204,27 +252,45 @@ STRATEGY:
 <complete strategy.ts file content>
 \`\`\``;
 
-  const result = await generateText({
-    model: MODEL,
-    prompt,
-    maxOutputTokens: 2000,
-    temperature: 0.7,
-  });
+  const MAX_RETRIES = 3;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const result = await generateText({
+      model: MODEL,
+      prompt:
+        attempt === 1
+          ? prompt
+          : prompt +
+            "\n\nIMPORTANT: Your previous response was not formatted correctly. You MUST include a ```typescript code block with the complete strategy.ts file.",
+      // maxOutputTokens: 2000,
+      // temperature: 0.7,
+    });
 
-  const text = result.text;
+    const text = result.text;
 
-  // Parse description
-  const descMatch = text.match(/DESCRIPTION:\s*(.+)/);
-  const description = descMatch?.[1]?.trim() ?? "No description provided";
+    // Parse description
+    const descMatch = text.match(/DESCRIPTION:\s*(.+)/);
+    const description = descMatch?.[1]?.trim() ?? "No description provided";
 
-  // Parse strategy code block
-  const codeMatch = text.match(/```typescript\n([\s\S]*?)```/);
-  if (!codeMatch) {
-    throw new Error("Agent did not return a valid strategy code block");
+    // Parse strategy code block — try multiple formats
+    const codeMatch =
+      text.match(/```typescript\n([\s\S]*?)```/) ??
+      text.match(/```ts\n([\s\S]*?)```/) ??
+      text.match(/```\n([\s\S]*?)```/);
+
+    if (codeMatch) {
+      return { newStrategy: codeMatch[1].trim(), description };
+    }
+
+    if (attempt < MAX_RETRIES) {
+      console.log(
+        `   Retry ${attempt}/${MAX_RETRIES} — agent response missing code block`,
+      );
+    }
   }
-  const newStrategy = codeMatch[1].trim();
 
-  return { newStrategy, description };
+  throw new Error(
+    "Agent failed to return a valid strategy code block after 3 attempts",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +301,7 @@ async function runExperiment(
   expNum: number,
   baselineScore: number,
   baselineMetrics: Record<string, number>,
+  systemContext: string,
 ) {
   const program = readFileSync(PROGRAM_PATH, "utf-8");
   const currentStrategy = readFileSync(STRATEGY_PATH, "utf-8");
@@ -257,6 +324,7 @@ async function runExperiment(
     baselineScore,
     baselineMetrics,
     expNum,
+    systemContext,
   );
   console.log(`   Hypothesis: ${description}`);
 
@@ -370,6 +438,21 @@ async function main() {
   console.log(`Model: ${MODEL}`);
   console.log(`Max runs: ${MAX_RUNS === Infinity ? "unlimited" : MAX_RUNS}`);
 
+  // Reset from previous run
+  console.log("Resetting from previous run...");
+
+  // Clear old experiments
+  if (existsSync(EXPERIMENTS_DIR)) rmSync(EXPERIMENTS_DIR, { recursive: true });
+  if (existsSync(EXPERIMENTS_CSV)) rmSync(EXPERIMENTS_CSV);
+
+  // Reset strategy.ts selections to empty (preserve userId and cutoff)
+  const strategyContent = readFileSync(STRATEGY_PATH, "utf-8");
+  const resetStrategy = strategyContent.replace(
+    /selections:\s*\{[^}]*\}\s*as\s*Record<string,\s*number>/s,
+    "selections: {} as Record<string, number>",
+  );
+  writeFileSync(STRATEGY_PATH, resetStrategy);
+
   // Setup
   ensureExperimentsCSV();
   mkdirSync(EXPERIMENTS_DIR, { recursive: true });
@@ -405,6 +488,9 @@ async function main() {
   );
   console.log(`Baseline score: ${baselineScoreResult.score}`);
 
+  // Fetch system context once (e.g., available opportunities from API)
+  const systemContext = await fetchSystemContext();
+
   // Loop
   let currentScore = baselineScoreResult.score;
   let currentMetrics = baselineEval.metrics;
@@ -412,7 +498,12 @@ async function main() {
 
   while (expNum <= MAX_RUNS) {
     try {
-      const result = await runExperiment(expNum, currentScore, currentMetrics);
+      const result = await runExperiment(
+        expNum,
+        currentScore,
+        currentMetrics,
+        systemContext,
+      );
       currentScore = result.score;
       currentMetrics = result.metrics;
     } catch (err) {
